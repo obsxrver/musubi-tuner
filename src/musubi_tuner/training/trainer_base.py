@@ -505,6 +505,7 @@ class NetworkTrainer:
         noise_scheduler: FlowMatchDiscreteScheduler,
         device: torch.device,
         dtype: torch.dtype,
+        return_sigmas: bool = False,
     ):
         batch_size = noise.shape[0]
 
@@ -543,19 +544,21 @@ class NetworkTrainer:
             logsnr = mean + std * math.sqrt(2.0) * torch.erfinv(term)
             return logsnr
 
-        if (
-            args.timestep_sampling == "uniform"
-            or args.timestep_sampling == "sigmoid"
-            or args.timestep_sampling == "shift"
-            or args.timestep_sampling == "flux_shift"
-            or args.timestep_sampling == "qwen_shift"
-            or args.timestep_sampling == "krea2_shift"
-            or args.timestep_sampling == "ideogram4_shift"
-            or args.timestep_sampling == "logsnr"
-            or args.timestep_sampling == "qinglong_flux"
-            or args.timestep_sampling == "qinglong_qwen"
-            or args.timestep_sampling == "flux2_shift"
-        ):
+        uses_direct_timestep_sampling = args.timestep_sampling in {
+            "uniform",
+            "sigmoid",
+            "shift",
+            "flux_shift",
+            "qwen_shift",
+            "krea2_shift",
+            "ideogram4_shift",
+            "logsnr",
+            "qinglong_flux",
+            "qinglong_qwen",
+            "flux2_shift",
+        }
+
+        if uses_direct_timestep_sampling:
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
                 def rand(bs: int, org_ts: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -701,11 +704,8 @@ class NetworkTrainer:
                 else:
                     t = torch.stack(available_t, dim=0)  # [batch_size, ]
 
-            timesteps = t * 1000.0
-            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
-            noisy_model_input = (1 - t) * latents + t * noise
-
-            timesteps += 1  # 1 to 1000
+            sigmas = t
+            timesteps = t * 1000.0 + 1.0  # 1 to 1000
         else:
             # Sample a random timestep for each image
             # for weighting schemes where we sample timesteps non-uniformly
@@ -724,7 +724,16 @@ class NetworkTrainer:
             timesteps = noise_scheduler.timesteps[indices].to(device=device)  # 1 to 1000
 
             # Add noise according to flow matching.
-            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype)
+
+        sigmas = sigmas.flatten()
+        if return_sigmas:
+            return sigmas, timesteps
+
+        sigmas = sigmas.view(-1, *([1] * (latents.ndim - 1)))
+        if uses_direct_timestep_sampling:
+            noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+        else:
             noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
 
         # print(f"actual timesteps: {timesteps}")

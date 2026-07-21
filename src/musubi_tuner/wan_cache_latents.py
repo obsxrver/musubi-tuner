@@ -41,8 +41,7 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
 
     # print(f"encode batch: {contents.shape}")
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-        latent = vae.encode(contents)  # list of Tensor[C, F, H, W]
-    latent = torch.stack(latent, dim=0)  # B, C, F, H, W
+        latent = vae.encode_tensor(contents)  # B, C, F, H, W
     latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
 
     if i2v:
@@ -72,8 +71,7 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         padding_frames = F - 1  # The first frame is the input image
         images_resized = torch.concat([images, torch.zeros(B, 3, padding_frames, h, w, device=vae.device)], dim=2)
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            y = vae.encode(images_resized)
-        y = torch.stack(y, dim=0)  # B, C, F, H, W
+            y = vae.encode_tensor(images_resized)  # B, C, F, H, W
 
         y = y[:, :, :F]  # may be not needed
         y = y.to(vae.dtype)  # convert to bfloat16
@@ -100,8 +98,7 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         control_contents = control_contents.to(vae.device, dtype=vae.dtype)
         control_contents = control_contents / 127.5 - 1.0  # normalize to [-1, 1]
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            control_latent = vae.encode(control_contents)  # list of Tensor[C, F, H, W]
-        control_latent = torch.stack(control_latent, dim=0)  # B, C, F, H, W
+            control_latent = vae.encode_tensor(control_contents)  # B, C, F, H, W
         control_latent = control_latent.to(vae.dtype)  # convert to bfloat16
     else:
         control_latent = None
@@ -142,15 +139,11 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
     # print(f"encode batch: {contents.shape}")
     with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
         # VAE encode: we need to encode one frame at a time because VAE encoder has stride=4 for the time dimension except for the first frame.
-        latent = []
-        for bi in range(contents.shape[0]):
-            c = contents[bi : bi + 1]  # B, C, F, H, W, b=1
-            l = []
-            for f in range(c.shape[2]):  # iterate over frames
-                cf = c[:, :, f : f + 1, :, :]  # B, C, 1, H, W
-                l.append(vae.encode(cf)[0].unsqueeze(0))  # list of [C, 1, H, W] to [1, C, 1, H, W]
-            latent.append(torch.cat(l, dim=2))  # B, C, F, H, W
-        latent = torch.cat(latent, dim=0)  # B, C, F, H, W
+        batch_size, channels, frame_count, height, width = contents.shape
+        frames = contents.permute(0, 2, 1, 3, 4).reshape(batch_size * frame_count, channels, 1, height, width)
+        latent = vae.encode_tensor(frames)
+        latent = latent[:, :, 0].reshape(batch_size, frame_count, latent.shape[1], latent.shape[3], latent.shape[4])
+        latent = latent.permute(0, 2, 1, 3, 4).contiguous()
 
     latent = latent.to(vae.dtype)  # convert to bfloat16, we are not sure if this is correct
     control_latent = latent[:, :, :-1, :, :]
@@ -161,7 +154,7 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
     shape = (1, contents.shape[1], 1, contents.shape[3], contents.shape[4])  # B=1, C, F=1, H, W
     if shape not in black_image_latents:
         with torch.amp.autocast(device_type=vae.device.type, dtype=vae.dtype), torch.no_grad():
-            black_image_latent = vae.encode(torch.zeros(shape, device=vae.device, dtype=vae.dtype))[0]
+            black_image_latent = vae.encode_tensor(torch.zeros(shape, device=vae.device, dtype=vae.dtype))[0]
         black_image_latent = black_image_latent.to(device="cpu", dtype=vae.dtype)
         black_image_latents[shape] = black_image_latent  # store for future use
     black_image_latent = black_image_latents[shape]  # [C, 1, H, W]
@@ -175,11 +168,9 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
         )
 
     images = contents[:, :, 0:num_control_images, :, :]  # B, C, F, H, W
-    clip_context = []
-    for i in range(images.shape[0]):
-        with torch.amp.autocast(device_type=clip.device.type, dtype=torch.float16), torch.no_grad():
-            clip_context.append(clip.visual(images[i : i + 1]))
-    clip_context = torch.stack(clip_context, dim=0)  # B, num_control_images, N, D
+    with torch.amp.autocast(device_type=clip.device.type, dtype=torch.float16), torch.no_grad():
+        clip_context = clip.visual(images)
+    clip_context = clip_context.unflatten(0, (batch_size, num_control_images))  # B, num_control_images, N, D
     clip_context = clip_context.to(torch.float16)  # convert to fp16
 
     B, C, _, lat_h, lat_w = latent.shape

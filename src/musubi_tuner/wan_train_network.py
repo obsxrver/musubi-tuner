@@ -542,43 +542,59 @@ class WanNetworkTrainer(NetworkTrainer):
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
         # high-low training case
-        # call super to get the noisy model input and timesteps, and sample only the first one, and choose the model we want based on the timestep
-        noisy_model_input, sample_timesteps = super().get_noisy_model_input_and_timesteps(
-            args, noise[0:1], latents[0:1], timesteps[0:1] if timesteps is not None else None, noise_scheduler, device, dtype
+        # Sample the whole batch once, then keep candidates from the same high/low regime as the first item.
+        # Sampling coefficients separately avoids constructing full noisy latents for rejected candidates.
+        bsize = latents.shape[0]
+        candidate_sigmas, candidate_timesteps = super().get_noisy_model_input_and_timesteps(
+            args, noise, latents, timesteps, noise_scheduler, device, dtype, return_sigmas=True
         )
-        high_noise = sample_timesteps[0] / 1000.0 >= self.timestep_boundary
+        high_noise = bool((candidate_timesteps[0] / 1000.0 >= self.timestep_boundary).item())
         self.next_model_is_high_noise = high_noise
 
-        # choose each member of latents for high or low noise model. because we want to train all the latents
         num_max_calls = 100
-        final_noisy_model_inputs = []
-        final_timesteps_list = []
-        bsize = latents.shape[0]
-        for i in range(bsize):
-            for _ in range(num_max_calls):
-                ts_i = [self.get_bucketed_timestep()] if self.num_timestep_buckets is not None else None
+        final_sigmas = torch.empty_like(candidate_sigmas)
+        final_timesteps = torch.empty_like(candidate_timesteps)
+        pending_indices = torch.arange(bsize, device=candidate_timesteps.device)
 
-                noisy_model_input, ts_i = super().get_noisy_model_input_and_timesteps(
-                    args, noise[i : i + 1], latents[i : i + 1], ts_i, noise_scheduler, device, dtype
-                )
-                if (high_noise and ts_i[0] / 1000.0 >= self.timestep_boundary) or (
-                    not high_noise and ts_i[0] / 1000.0 < self.timestep_boundary
-                ):
-                    final_noisy_model_inputs.append(noisy_model_input)
-                    final_timesteps_list.append(ts_i)
-                    break
+        for attempt in range(num_max_calls):
+            candidate_is_high_noise = candidate_timesteps / 1000.0 >= self.timestep_boundary
+            accepted = candidate_is_high_noise if high_noise else ~candidate_is_high_noise
+            accepted_indices = pending_indices[accepted]
+            final_sigmas[accepted_indices] = candidate_sigmas[accepted]
+            final_timesteps[accepted_indices] = candidate_timesteps[accepted]
+            pending_indices = pending_indices[~accepted]
 
-        if len(final_noisy_model_inputs) < bsize:
+            if pending_indices.numel() == 0:
+                break
+            if attempt == num_max_calls - 1:
+                break
+
+            candidate_count = pending_indices.numel()
+            candidate_inputs = (
+                [self.get_bucketed_timestep() for _ in range(candidate_count)]
+                if self.num_timestep_buckets is not None
+                else None
+            )
+            candidate_sigmas, candidate_timesteps = super().get_noisy_model_input_and_timesteps(
+                args,
+                noise[:candidate_count],
+                latents[:candidate_count],
+                candidate_inputs,
+                noise_scheduler,
+                device,
+                dtype,
+                return_sigmas=True,
+            )
+
+        if pending_indices.numel() > 0:
             logger.warning(
                 f"No valid noisy model inputs found for bsize={bsize}, high_noise={high_noise}, timestep_boundary={self.timestep_boundary}"
             )
             # fall back to the original method
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
-        # final noisy model input may have less than bsize elements, it will be fine for training
-        final_noisy_model_input = torch.cat(final_noisy_model_inputs, dim=0)
-        final_timesteps = torch.cat(final_timesteps_list, dim=0)
-
+        sigmas = final_sigmas.view(-1, *([1] * (latents.ndim - 1)))
+        final_noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
         return final_noisy_model_input, final_timesteps
 
     def swap_high_low_weights(self, args: argparse.Namespace, accelerator: Accelerator, model: WanModel):

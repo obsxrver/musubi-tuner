@@ -535,15 +535,17 @@ class WanVAE_(nn.Module):
         # ## 对encode输入的x，按时间拆分为1、4、4、4....
 
         # if self.cache_device is None:
+        outs = []
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
                 out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
             else:
-                out_ = self.encoder(
+                out = self.encoder(
                     x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
                 )
-                out = torch.cat([out, out_], 2)
+            outs.append(out)
+        out = torch.cat(outs, dim=2)
         # else:
         #     # VRAM optimization
         #     device = x.device
@@ -578,13 +580,12 @@ class WanVAE_(nn.Module):
         x = self.conv2(z)
 
         # if self.cache_device is None:
+        outs = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
-            else:
-                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+            out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+            outs.append(out)
+        out = torch.cat(outs, dim=2)
         # else:
         #     # VRAM optimization
         #     device = z.device
@@ -750,11 +751,27 @@ class WanVAE:
 
     def encode(self, videos):
         """
-        videos: A list of videos each with shape [C, T, H, W].
+        videos: A batched tensor [B, C, T, H, W] or list of videos [C, T, H, W].
         """
         # with amp.autocast(dtype=self.dtype):
+        if isinstance(videos, torch.Tensor):
+            return list(self.encode_tensor(videos).unbind(0))
         return [self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0) for u in videos]
+
+    def encode_tensor(self, videos: torch.Tensor) -> torch.Tensor:
+        """Encode a same-shaped batch and return a single batched tensor."""
+        if videos.ndim != 5:
+            raise ValueError(f"Batched videos must be 5D [B, C, T, H, W], got shape {tuple(videos.shape)}")
+        return self.model.encode(videos, self.scale).float()
 
     def decode(self, zs):
         # with amp.autocast(dtype=self.dtype):
+        if isinstance(zs, torch.Tensor):
+            return list(self.decode_tensor(zs).unbind(0))
         return [self.model.decode(u.unsqueeze(0), self.scale).float().clamp_(-1, 1).squeeze(0) for u in zs]
+
+    def decode_tensor(self, zs: torch.Tensor) -> torch.Tensor:
+        """Decode a same-shaped latent batch and return a single batched tensor."""
+        if zs.ndim != 5:
+            raise ValueError(f"Batched latents must be 5D [B, C, T, H, W], got shape {tuple(zs.shape)}")
+        return self.model.decode(zs, self.scale).float().clamp_(-1, 1)
