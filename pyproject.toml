@@ -45,6 +45,9 @@ gui = [
 hidream_o1 = [
     "sensecraft[dinov3]>=0.3.11",
 ]
+int8 = [
+    "comfy-kitchen==0.2.26",
+]
 
 [tool.uv]
 conflicts = [

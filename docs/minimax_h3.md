@@ -4,7 +4,7 @@
 
 Musubi Tuner supports experimental LoRA training of the MiniMax H3 **FL2VA** checkpoint in joint text-to-video-with-audio (T2VA) mode. Video and stereo audio are trained together. The separate Ref2VA checkpoint and reference-media conditioning are not supported yet, nor is sample generation during training.
 
-H3 is exceptionally large. BF16 is currently required for the transformer; the ComfyUI INT8/ConvRot and NVFP4 checkpoints cannot be trained by this implementation. Gradient checkpointing and block swap are strongly recommended.
+H3 is exceptionally large. BF16 compute is required, but the frozen transformer base may use either BF16 or ComfyUI INT8/ConvRot weights. Both the regular and pruned FL2VA INT8/ConvRot checkpoints are supported; NVFP4 is not. Gradient checkpointing and block swap are strongly recommended.
 
 ## Model files
 
@@ -13,6 +13,8 @@ Either model distribution can be used:
 - [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3): download the complete `FL2VA` directory. Pass the repository directory to every model argument; the scripts locate each component and all of its shards.
 - [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3): download these individual files:
   - `diffusion_models/minimax_h3_fl2va_bf16.safetensors`
+  - `diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors` (lower base-model memory)
+  - `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` (lowest base-model memory)
   - `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`
   - `vae/minimax_h3_video_vae_fp16.safetensors`
   - `vae/minimax_h3_audio_vae_fp32.safetensors`
@@ -21,6 +23,12 @@ For example, the official files can be downloaded with:
 
 ```bash
 hf download MiniMaxAI/MiniMax-H3 --include "FL2VA/*" --local-dir models/MiniMax-H3
+```
+
+For the optimized INT8 kernels, install the optional dependency (the trainer also has a native PyTorch fallback):
+
+```bash
+uv sync --extra int8
 ```
 
 ## Dataset
@@ -84,13 +92,14 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
   --output_dir path/to/output --output_name h3-lora
 ```
 
+To train against a Comfy INT8/ConvRot base, point `--dit` at either FL2VA INT8 file listed above. Do not pass `--fp8_base` or `--fp8_scaled`; quantization is detected from the checkpoint metadata. The frozen base uses INT8 forward matmuls, while its input-gradient path dequantizes bounded BF16 chunks for training accuracy. The trainable LoRA and model compute remain BF16.
+
 H3 uses a video sigma shift of 12 and an audio sigma shift of 3. The trainer samples the video schedule, maps the same base time to the audio schedule, noises both cached streams, and optimizes both raw `clean-noise` velocity targets. `--audio_loss_weight` controls the audio term relative to video.
 
 Notes:
 
 - Loader batches larger than one are accepted, but each packed H3 sequence is evaluated serially because sequence lengths are shape-dependent.
 - `--blocks_to_swap` can be at most 48 for the 50-block transformer.
-- `--fp8_base` and `--fp8_scaled` are rejected. Use the BF16 FL2VA checkpoint.
+- `--fp8_base` and `--fp8_scaled` are rejected. INT8/ConvRot is selected by the `--dit` checkpoint itself.
 - Omit `--sample_prompts`; in-training H3 sampling is not implemented.
 - Cached audio is part of every sample. Audio-free training is represented by silent source tracks rather than dropping the audio stream.
-

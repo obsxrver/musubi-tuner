@@ -3,21 +3,37 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable
 
 import torch
 
 from musubi_tuner.minimax_h3.model import MiniMaxH3Model
+from musubi_tuner.modules.int8_optimization_utils import (
+    Int8ConvRotConfig,
+    apply_int8_convrot_monkey_patch,
+)
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
-
 
 VIDEO_FPS = 24
 AUDIO_SAMPLE_RATE = 32_000
 AUDIO_LATENTS_PER_SECOND = 40
 VIDEO_FRAME_STRIDE = 17
 VIDEO_FRAME_OFFSET = 5
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TransformerCheckpointLayout:
+    int8_convrot_layers: dict[str, Int8ConvRotConfig]
+    adaln_curve_grid: int | None = None
+    adaln_curve_dim: int | None = None
 
 
 def is_valid_frame_count(frame_count: int) -> bool:
@@ -52,7 +68,7 @@ def _index_files(index_path: Path) -> list[Path]:
     return [index_path.parent / name for name in dict.fromkeys(weight_map.values())]
 
 
-def resolve_safetensor_files(path: str, component: Optional[str] = None) -> list[Path]:
+def resolve_safetensor_files(path: str, component: str | None = None) -> list[Path]:
     """Resolve a Comfy single file or an official sharded component directory."""
 
     candidate = Path(path).expanduser()
@@ -85,13 +101,67 @@ def resolve_safetensor_files(path: str, component: Optional[str] = None) -> list
     raise FileNotFoundError(f"No safetensors weights found for {component or 'model'} under {candidate}")
 
 
+def inspect_transformer_checkpoint(files: Iterable[Path]) -> TransformerCheckpointLayout:
+    """Read H3 shape and Comfy quantization metadata without loading large weights."""
+
+    int8_layers: dict[str, Int8ConvRotConfig] = {}
+    curve_grid = None
+    curve_dim = None
+    for filename in files:
+        with MemoryEfficientSafeOpen(str(filename)) as reader:
+            if "adaln_t_table" in reader.header:
+                shape = tuple(reader.header["adaln_t_table"]["shape"])
+                if len(shape) != 2 or shape[0] < 2:
+                    raise ValueError(f"Invalid H3 adaLN curve table shape {shape} in {filename}")
+                if curve_grid is not None and (curve_grid, curve_dim) != shape:
+                    raise ValueError("H3 checkpoint shards disagree about the adaLN curve table shape")
+                curve_grid, curve_dim = shape
+
+            reader_keys = reader.keys()
+            for marker_key in (key for key in reader_keys if key.endswith(".comfy_quant")):
+                module_name = marker_key[: -len(".comfy_quant")]
+                try:
+                    marker = reader.get_tensor(marker_key, device=torch.device("cpu"))
+                    config = json.loads(marker.numpy().tobytes())
+                except Exception as exc:
+                    raise ValueError(f"Invalid Comfy quantization marker {marker_key} in {filename}") from exc
+
+                params = config.get("params", {})
+                if not isinstance(params, dict):
+                    params = {}
+                quant_format = config.get("format")
+                convrot = config.get("convrot", params.get("convrot", False))
+                if quant_format != "int8_tensorwise" or not convrot:
+                    raise ValueError(
+                        f"MiniMax H3 training supports only INT8 ConvRot quantized layers; {module_name} uses {quant_format!r}"
+                    )
+
+                weight_key = f"{module_name}.weight"
+                scale_key = f"{module_name}.weight_scale"
+                if weight_key not in reader.header or scale_key not in reader.header:
+                    raise ValueError(f"INT8 ConvRot layer {module_name} is missing its weight or weight_scale")
+                if reader.header[weight_key]["dtype"] != "I8":
+                    raise ValueError(f"INT8 ConvRot layer {module_name} has non-I8 storage")
+                weight_shape = tuple(reader.header[weight_key]["shape"])
+                if len(weight_shape) != 2:
+                    raise ValueError(f"INT8 ConvRot layer {module_name} must have a 2-D weight")
+                scale_shape = tuple(reader.header[scale_key]["shape"])
+                group_size = int(config.get("convrot_groupsize", params.get("convrot_groupsize", 256)))
+                layer_config = Int8ConvRotConfig(group_size=group_size, scale_shape=scale_shape)
+                if module_name in int8_layers and int8_layers[module_name] != layer_config:
+                    raise ValueError(f"Conflicting INT8 ConvRot metadata for {module_name}")
+                int8_layers[module_name] = layer_config
+
+    return TransformerCheckpointLayout(int8_layers, curve_grid, curve_dim)
+
+
 def load_selected_weights(
     model: torch.nn.Module,
     files: Iterable[Path],
     *,
     device: torch.device | str,
-    dtype: Optional[torch.dtype] | Callable[[str], Optional[torch.dtype]],
-    key_transform: Callable[[str], Optional[str]] = lambda key: key,
+    dtype: torch.dtype | None | Callable[[str], torch.dtype | None],
+    key_transform: Callable[[str], str | None] = lambda key: key,
     disable_numpy_memmap: bool = False,
 ) -> None:
     """Assign selected tensors into a meta-initialized module, one shard at a time."""
@@ -101,16 +171,16 @@ def load_selected_weights(
     for filename in files:
         shard = {}
         with MemoryEfficientSafeOpen(str(filename), disable_numpy_memmap=disable_numpy_memmap) as reader:
-            for source_key in reader.keys():
+            reader_keys = reader.keys()
+            for source_key in reader_keys:
                 key = key_transform(source_key)
                 if key is None or key not in expected:
                     continue
                 source_dtype = reader.header[source_key]["dtype"]
-                if source_dtype not in {"F16", "BF16", "F32", "F64"}:
-                    raise ValueError(
-                        f"Quantized checkpoint tensor {source_key} ({source_dtype}) is not supported for H3 training; use BF16 weights"
-                    )
                 target_dtype = dtype(key) if callable(dtype) else dtype
+                is_supported_int8 = source_dtype == "I8" and target_dtype == torch.int8
+                if source_dtype not in {"F16", "BF16", "F32", "F64"} and not is_supported_int8:
+                    raise ValueError(f"Quantized checkpoint tensor {source_key} ({source_dtype}) is not supported for H3 training")
                 tensor = reader.get_tensor(source_key, device=torch.device(device), dtype=target_dtype)
                 shard[key] = tensor
                 loaded.add(key)
@@ -127,14 +197,26 @@ def load_transformer(
     path: str,
     *,
     device: torch.device | str = "cpu",
-    dtype: Optional[torch.dtype] = torch.bfloat16,
+    dtype: torch.dtype | None = torch.bfloat16,
     attn_mode: str = "torch",
     split_attn: bool = False,
     disable_numpy_memmap: bool = False,
 ) -> MiniMaxH3Model:
     files = resolve_safetensor_files(path, "transformer")
+    layout = inspect_transformer_checkpoint(files)
     with torch.device("meta"):
-        model = MiniMaxH3Model(attn_mode=attn_mode, split_attn=split_attn)
+        model = MiniMaxH3Model(
+            time_embed_dim=layout.adaln_curve_dim or 2688,
+            adaln_curve_grid=layout.adaln_curve_grid,
+            attn_mode=attn_mode,
+            split_attn=split_attn,
+        )
+    if layout.int8_convrot_layers:
+        apply_int8_convrot_monkey_patch(model, layout.int8_convrot_layers)
+        logger.info(
+            "Loading MiniMax H3%s INT8 ConvRot transformer",
+            " pruned" if layout.adaln_curve_grid is not None else "",
+        )
     fp32_prefixes = (
         "audio_patch_proj.",
         "video_patch_proj.",
@@ -143,11 +225,23 @@ def load_transformer(
         "final_layer.video_out.",
         "rope.inv_freq",
     )
+    int8_weight_keys = {f"{name}.weight" for name in layout.int8_convrot_layers}
+    int8_scale_keys = {f"{name}.weight_scale" for name in layout.int8_convrot_layers}
+
+    def target_dtype(key: str) -> torch.dtype | None:
+        if key in int8_weight_keys:
+            return torch.int8
+        if key in int8_scale_keys:
+            return torch.float32
+        if layout.adaln_curve_grid is not None and (key == "adaln_t_table" or ".adaln_proj.linear." in key):
+            return torch.float32
+        return torch.float32 if key.startswith(fp32_prefixes) else dtype
+
     load_selected_weights(
         model,
         files,
         device=device,
-        dtype=lambda key: torch.float32 if key.startswith(fp32_prefixes) else dtype,
+        dtype=target_dtype,
         disable_numpy_memmap=disable_numpy_memmap,
     )
     model.eval()

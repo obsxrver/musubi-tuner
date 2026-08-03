@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import argparse
 import logging
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,6 @@ from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file,
 from musubi_tuner.minimax_h3 import minimax_h3_utils
 from musubi_tuner.minimax_h3.model import MiniMaxH3Model, time_shift_sigma
 from musubi_tuner.utils import model_utils
-
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +28,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         if args.fp8_base or args.fp8_scaled:
-            raise ValueError("MiniMax H3 training currently requires BF16 transformer weights; FP8/INT8 is not supported")
+            raise ValueError("MiniMax H3 does not support the FP8 flags. Pass a Comfy INT8 ConvRot checkpoint to --dit directly.")
         if args.mixed_precision not in (None, "bf16"):
             raise ValueError("MiniMax H3 training requires --mixed_precision bf16")
         args.mixed_precision = "bf16"
@@ -61,10 +61,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         attn_mode: str,
         split_attn: bool,
         loading_device: str,
-        dit_weight_dtype: Optional[torch.dtype],
+        dit_weight_dtype: torch.dtype | None,
     ):
         if dit_weight_dtype not in (None, torch.bfloat16):
-            raise ValueError(f"MiniMax H3 transformer must be loaded as BF16, got {dit_weight_dtype}")
+            raise ValueError(f"MiniMax H3 compute must use BF16, got {dit_weight_dtype}")
         model = minimax_h3_utils.load_transformer(
             dit_path,
             device=loading_device,
@@ -132,7 +132,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     ):
         if "latents_audio" not in batch or "h3_text_embed" not in batch:
             raise ValueError("H3 audio and text caches are missing; run both minimax_h3 cache commands first")
-        sigma_video, timesteps = self.get_noisy_model_input_and_timesteps(
+        sigma_video, _timesteps = self.get_noisy_model_input_and_timesteps(
             args,
             noise,
             latents,

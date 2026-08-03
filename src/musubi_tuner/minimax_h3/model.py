@@ -11,16 +11,15 @@ layouts so either BF16 distribution can be loaded without a key conversion.
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch import nn
 
-from musubi_tuner.modules.attention import AttentionParams, attention as common_attention
+from musubi_tuner.modules.attention import AttentionParams
+from musubi_tuner.modules.attention import attention as common_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
-
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
@@ -170,9 +169,7 @@ class TimeEmbedder(nn.Module):
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         half = self.freq_dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half
-        )
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half)
         args = timestep.float()[:, None] * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         return self.proj_out(F.silu(self.proj_in(embedding)))
@@ -190,7 +187,7 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=eps)
         self.out_proj = nn.Linear(inner, hidden, bias=False)
 
-    def forward(self, x: torch.Tensor, rope_angles: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_angles: torch.Tensor | None = None) -> torch.Tensor:
         batch, sequence, _ = x.shape
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
         q = self.q_norm(q.reshape(batch, sequence, self.heads, self.head_dim))
@@ -231,7 +228,9 @@ class AdalnProj(nn.Module):
 
 
 class RefinerBlock(nn.Module):
-    def __init__(self, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float, attn_mode: str, split_attn: bool):
+    def __init__(
+        self, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float, attn_mode: str, split_attn: bool
+    ):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden, eps=eps)
         self.norm2 = nn.RMSNorm(hidden, eps=eps)
@@ -244,7 +243,19 @@ class RefinerBlock(nn.Module):
 
 
 class TokenRefiner(nn.Module):
-    def __init__(self, layers: int, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float, final_eps: float, attn_mode: str, split_attn: bool):
+    def __init__(
+        self,
+        layers: int,
+        hidden: int,
+        heads: int,
+        head_dim: int,
+        ffn: int,
+        eps: float,
+        qk_eps: float,
+        final_eps: float,
+        attn_mode: str,
+        split_attn: bool,
+    ):
         super().__init__()
         self.blocks = nn.ModuleList(
             [RefinerBlock(hidden, heads, head_dim, ffn, eps, qk_eps, attn_mode, split_attn) for _ in range(layers)]
@@ -261,36 +272,48 @@ class TokenRefiner(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden: int, heads: int, head_dim: int, ffn: int, time_dim: int, eps: float, qk_eps: float, attn_mode: str, split_attn: bool):
+    def __init__(
+        self,
+        hidden: int,
+        heads: int,
+        head_dim: int,
+        ffn: int,
+        time_dim: int,
+        eps: float,
+        qk_eps: float,
+        attn_mode: str,
+        split_attn: bool,
+        apply_silu: bool = True,
+    ):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden, eps=eps)
         self.norm2 = nn.RMSNorm(hidden, eps=eps)
         self.attn = Attention(hidden, heads, head_dim, qk_eps, attn_mode, split_attn)
         self.mlp = MLP(hidden, ffn)
-        self.adaln_proj = AdalnProj(time_dim, hidden, expand=6, modalities=3)
+        self.adaln_proj = AdalnProj(time_dim, hidden, expand=6, modalities=3, apply_silu=apply_silu)
 
     def forward(
         self, x: torch.Tensor, time_embedding: torch.Tensor, modulation_rows: torch.Tensor, rope_angles: torch.Tensor
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(time_embedding)
-        shift_msa = shift_msa[modulation_rows][None]
-        scale_msa = scale_msa[modulation_rows][None]
-        gate_msa = gate_msa[modulation_rows][None]
+        shift_msa = shift_msa[modulation_rows][None].to(x.dtype)
+        scale_msa = scale_msa[modulation_rows][None].to(x.dtype)
+        gate_msa = gate_msa[modulation_rows][None].to(x.dtype)
         hidden = self.norm1(x) * (1.0 + scale_msa) + shift_msa
         x = x + self.attn(hidden, rope_angles) * gate_msa
 
-        shift_mlp = shift_mlp[modulation_rows][None]
-        scale_mlp = scale_mlp[modulation_rows][None]
-        gate_mlp = gate_mlp[modulation_rows][None]
+        shift_mlp = shift_mlp[modulation_rows][None].to(x.dtype)
+        scale_mlp = scale_mlp[modulation_rows][None].to(x.dtype)
+        gate_mlp = gate_mlp[modulation_rows][None].to(x.dtype)
         hidden = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
         return x + self.mlp(hidden) * gate_mlp
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden: int, time_dim: int, video_dim: int, audio_dim: int, eps: float):
+    def __init__(self, hidden: int, time_dim: int, video_dim: int, audio_dim: int, eps: float, apply_silu: bool = True):
         super().__init__()
         self.norm = nn.RMSNorm(hidden, eps=eps)
-        self.adaln_proj = AdalnProj(time_dim, hidden, expand=2, modalities=1)
+        self.adaln_proj = AdalnProj(time_dim, hidden, expand=2, modalities=1, apply_silu=apply_silu)
         self.video_out = nn.Linear(hidden, video_dim, bias=True, dtype=torch.float32)
         self.audio_out = nn.Linear(hidden, audio_dim, bias=True, dtype=torch.float32)
 
@@ -307,8 +330,8 @@ class FinalLayer(nn.Module):
         normalized = self.norm(x)
         video = normalized[:, video_slice[0] : video_slice[1]]
         audio = normalized[:, audio_slice[0] : audio_slice[1]]
-        video = video * (1.0 + scale[video_time_row]) + shift[video_time_row]
-        audio = audio * (1.0 + scale[audio_time_row]) + shift[audio_time_row]
+        video = video * (1.0 + scale[video_time_row].to(video.dtype)) + shift[video_time_row].to(video.dtype)
+        audio = audio * (1.0 + scale[audio_time_row].to(audio.dtype)) + shift[audio_time_row].to(audio.dtype)
         return self.video_out(video.float()), self.audio_out(audio.float())
 
 
@@ -334,6 +357,7 @@ class MiniMaxH3Model(nn.Module):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
+        adaln_curve_grid: int | None = None,
         sigma_shift_video: float = VIDEO_SIGMA_SHIFT,
         sigma_shift_audio: float = AUDIO_SIGMA_SHIFT,
         attn_mode: str = "torch",
@@ -346,12 +370,16 @@ class MiniMaxH3Model(nn.Module):
         self.audio_latents_dim = audio_latents_dim
         self.sigma_shift_video = sigma_shift_video
         self.sigma_shift_audio = sigma_shift_audio
+        self.use_adaln_curves = adaln_curve_grid is not None
 
         video_patch_dim = latents_dim * math.prod(self.patch_size)
         self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True, dtype=torch.float32)
         self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True, dtype=torch.float32)
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
-        self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
+        if self.use_adaln_curves:
+            self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=torch.float32))
+        else:
+            self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
         self.rope = nn.Module()
         self.rope.register_buffer("inv_freq", torch.empty(rope_inv_freq_len, dtype=torch.float32))
         self.token_refiner = TokenRefiner(
@@ -378,11 +406,19 @@ class MiniMaxH3Model(nn.Module):
                     qk_norm_eps,
                     attn_mode,
                     split_attn,
+                    apply_silu=not self.use_adaln_curves,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_patch_dim, audio_latents_dim, final_norm_eps)
+        self.final_layer = FinalLayer(
+            hidden_size,
+            time_embed_dim,
+            video_patch_dim,
+            audio_latents_dim,
+            final_norm_eps,
+            apply_silu=not self.use_adaln_curves,
+        )
 
         self.gradient_checkpointing = False
         self.blocks_to_swap = 0
@@ -436,7 +472,7 @@ class MiniMaxH3Model(nn.Module):
         audio: torch.Tensor,
         sigma_video: torch.Tensor,
         context: torch.Tensor,
-        text_token_tags: Optional[torch.Tensor],
+        text_token_tags: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if video.shape[0] != 1 or audio.shape[0] != 1 or context.shape[0] != 1:
             raise ValueError("_forward_single requires batch size 1")
@@ -478,7 +514,13 @@ class MiniMaxH3Model(nn.Module):
         hidden = torch.cat([context, audio_embed, video_embed], dim=1)
 
         time_values = torch.tensor(unique_times, device=video.device, dtype=torch.float32)
-        time_embedding = self.time_embedder(time_values).to(compute_dtype)
+        if self.use_adaln_curves:
+            table = self.adaln_t_table.to(device=video.device)
+            position = time_values.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            lower = position.floor().long().clamp(max=table.shape[0] - 2)
+            time_embedding = torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
+        else:
+            time_embedding = self.time_embedder(time_values).to(compute_dtype)
         rope_angles = self.rope_angles(layout.position_ids, video.device)
 
         for index, block in enumerate(self.blocks):
@@ -517,7 +559,7 @@ class MiniMaxH3Model(nn.Module):
         audio: torch.Tensor,
         sigma_video: torch.Tensor,
         context: torch.Tensor | list[torch.Tensor],
-        text_token_tags: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return raw checkpoint predictions (``clean - noise``) for both streams.
 
@@ -529,12 +571,12 @@ class MiniMaxH3Model(nn.Module):
         outputs_video: list[torch.Tensor] = []
         outputs_audio: list[torch.Tensor] = []
         for index in range(video.shape[0]):
-            context_i = context[index] if isinstance(context, list) else context[index]
+            context_i = context[index]
             if context_i.ndim == 2:
                 context_i = context_i.unsqueeze(0)
             tags_i = None
             if text_token_tags is not None:
-                tags_i = text_token_tags[index] if isinstance(text_token_tags, list) else text_token_tags[index]
+                tags_i = text_token_tags[index]
             video_i, audio_i = self._forward_single(
                 video[index : index + 1],
                 audio[index : index + 1],
