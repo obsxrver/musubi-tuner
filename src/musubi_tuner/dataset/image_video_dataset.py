@@ -810,6 +810,10 @@ class VideoDataset(BaseDataset):
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                        if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                            # H3 FL2VA text states include the crop's first frame,
+                            # so each temporal crop needs its own text cache.
+                            item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                         item_info.source_path = video_key
                         item_info.source_frame_start = crop_pos
                         item_info.control_content = cropped_control  # None is allowed
@@ -897,6 +901,12 @@ class VideoDataset(BaseDataset):
 
             item_key = "_".join(tokens[:-3])
             text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            if self.architecture == ARCHITECTURE_MINIMAX_H3 and safetensors_utils.find_key(
+                cache_file, starts_with="latents_image_"
+            ):
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{item_key}_{tokens[-3]}_{self.architecture}_te.safetensors"
+                )
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue

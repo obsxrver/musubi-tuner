@@ -22,24 +22,34 @@ logging.basicConfig(level=logging.INFO)
 
 
 @torch.no_grad()
-def encode_and_save_batch(video_vae, audio_vae, batch: list[ItemInfo]):
+def encode_and_save_batch(video_vae, audio_vae, batch: list[ItemInfo], i2v: bool = False):
     for item in batch:
         if item.content is None or item.frame_count is None:
             raise ValueError(f"H3 requires video content for {item.item_key}")
         content = torch.from_numpy(item.content).unsqueeze(0).permute(0, 4, 1, 2, 3).contiguous()
         content = content.to(video_vae.device, dtype=video_vae.dtype) / 127.5 - 1.0
         video_latent = video_vae.encode(content)[0].to(video_vae.dtype)
+        image_latent = None
+        if i2v:
+            # FL2VA conditions on a separately encoded reference image, not the
+            # first temporal latent from the target-video encode.
+            image_latent = video_vae.encode_keyframe(content[:, :, :1])[0].to(video_vae.dtype)
 
         if item.source_path is None:
             raise ValueError(f"Original media path is unavailable for {item.item_key}")
         waveform = load_audio_segment(item.source_path, item.source_frame_start, item.frame_count)
         waveform = waveform.unsqueeze(0).to(audio_vae.device, dtype=audio_vae.dtype)
         audio_latent = audio_vae.encode(waveform, audio_latent_length(item.frame_count))[0]
-        save_latent_cache_minimax_h3(item, video_latent, audio_latent)
+        save_latent_cache_minimax_h3(item, video_latent, audio_latent, image_latent)
 
 
 def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--audio_vae", type=str, required=True, help="H3 audio VAE safetensors file or model directory")
+    parser.add_argument(
+        "--i2v",
+        action="store_true",
+        help="cache the first frame of each video as an H3 FL2VA reference image",
+    )
     parser.add_argument("--vae_tile_size", type=int, default=256, help="video VAE spatial tile size")
     parser.add_argument("--vae_tile_overlap", type=int, default=64, help="video VAE spatial tile overlap")
     parser.add_argument("--disable_vae_tiling", action="store_true", help="disable video VAE spatial tiling")
@@ -90,7 +100,7 @@ def main():
         args.audio_vae, device=device, dtype=dtype, disable_numpy_memmap=args.disable_numpy_memmap
     )
 
-    cache_latents.encode_datasets(datasets, lambda batch: encode_and_save_batch(video_vae, audio_vae, batch), args)
+    cache_latents.encode_datasets(datasets, lambda batch: encode_and_save_batch(video_vae, audio_vae, batch, args.i2v), args)
 
 
 if __name__ == "__main__":

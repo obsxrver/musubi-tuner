@@ -249,6 +249,25 @@ class MiniMaxH3VideoEncoder(nn.Module):
         std_value = self.latents_std.view(1, -1, 1, 1, 1).to(mean)
         return (mean - mean_value) / std_value
 
+    def encode_keyframe(self, x, seed: int = 42):
+        """Encode an FL2VA keyframe with H3's released conditioning recipe."""
+        if x.ndim == 4:
+            x = x.unsqueeze(2)
+        if x.shape[2] != 1:
+            raise ValueError(f"H3 keyframe encoding requires exactly one frame, got {x.shape[2]}")
+        x = ((x + 1.0) * 0.5 - self.pixel_mean.to(x)) / self.pixel_std.to(x)
+        moments = self._adaptive_encode(x)[:, :, -1:].float()
+        mean, logvar = moments.chunk(2, dim=1)
+        logvar = logvar.clamp(-30.0, 20.0)
+        # H3 samples every visual condition with an independent CPU generator
+        # seeded to 42, then rounds the raw sample to fp16 before normalization.
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(mean.shape, generator=generator, device="cpu", dtype=torch.float32).to(mean.device)
+        latent = (mean + torch.exp(0.5 * logvar) * noise).to(torch.float16).float()
+        mean_value = self.latents_mean.view(1, -1, 1, 1, 1).to(latent)
+        std_value = self.latents_std.view(1, -1, 1, 1, 1).to(latent)
+        return (latent - mean_value) / std_value
+
 
 def load_video_vae(
     path: str,
@@ -276,4 +295,3 @@ def load_video_vae(
     model.pixel_std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1, 1)
     model.eval().requires_grad_(False)
     return model
-

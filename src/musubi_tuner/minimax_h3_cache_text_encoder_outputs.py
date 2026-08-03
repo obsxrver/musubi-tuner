@@ -11,7 +11,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ItemInfo,
     save_text_encoder_output_cache_minimax_h3,
 )
-from musubi_tuner.minimax_h3.text_encoder import encode_prompts, load_text_encoder, load_tokenizer
+from musubi_tuner.minimax_h3.text_encoder import encode_prompts, load_processor, load_text_encoder, load_tokenizer
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 
@@ -20,8 +20,23 @@ logging.basicConfig(level=logging.INFO)
 
 
 @torch.no_grad()
-def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device, max_length):
-    embeds, tags = encode_prompts(tokenizer, text_encoder, [item.caption for item in batch], device, max_length)
+def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device, max_length, processor=None):
+    images = None
+    if processor is not None:
+        images = []
+        for item in batch:
+            if item.content is None or item.content.ndim != 4 or item.content.shape[0] == 0:
+                raise ValueError(f"H3 I2V text caching requires video content for {item.item_key}")
+            images.append(item.content[0])
+    embeds, tags = encode_prompts(
+        tokenizer,
+        text_encoder,
+        [item.caption for item in batch],
+        device,
+        max_length,
+        processor=processor,
+        images=images,
+    )
     for item, embed, token_tags in zip(batch, embeds, tags):
         save_text_encoder_output_cache_minimax_h3(item, embed, token_tags)
 
@@ -29,6 +44,12 @@ def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device
 def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder", type=str, required=True, help="H3 Qwen3-VL safetensors file or model directory")
     parser.add_argument("--tokenizer", type=str, default=None, help="tokenizer directory; defaults to the model bundle/Hugging Face")
+    parser.add_argument("--processor", type=str, default=None, help="Qwen3-VL processor directory for H3 I2V text caching")
+    parser.add_argument(
+        "--i2v",
+        action="store_true",
+        help="include each video crop's first frame as Qwen3-VL FL2VA context",
+    )
     parser.add_argument("--text_encoder_dtype", type=str, default="bfloat16", help="text encoder dtype")
     parser.add_argument("--max_token_length", type=int, default=1024, help="maximum raw prompt token length")
     parser.add_argument("--disable_numpy_memmap", action="store_true", help="disable memory-mapped checkpoint loading")
@@ -46,12 +67,17 @@ def main():
     all_files, all_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
     tokenizer = load_tokenizer(args.tokenizer, args.text_encoder)
+    processor = load_processor(args.processor, args.text_encoder) if args.i2v else None
     dtype = str_to_dtype(args.text_encoder_dtype)
     if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
         raise ValueError("MiniMax H3 text encoding requires float16, bfloat16, or float32")
-    logger.info("Loading MiniMax H3 Qwen3-VL text encoder (layers 0-49)")
+    logger.info("Loading MiniMax H3 Qwen3-VL %sencoder (layers 0-49)", "multimodal " if args.i2v else "text ")
     text_encoder = load_text_encoder(
-        args.text_encoder, device=device, dtype=dtype, disable_numpy_memmap=args.disable_numpy_memmap
+        args.text_encoder,
+        device=device,
+        dtype=dtype,
+        include_visual=args.i2v,
+        disable_numpy_memmap=args.disable_numpy_memmap,
     )
     cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
@@ -60,7 +86,8 @@ def main():
         datasets,
         all_files,
         all_paths,
-        lambda batch: encode_and_save_batch(tokenizer, text_encoder, batch, device, args.max_token_length),
+        lambda batch: encode_and_save_batch(tokenizer, text_encoder, batch, device, args.max_token_length, processor),
+        requires_content=args.i2v,
     )
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_files, all_paths, args.keep_cache)
 

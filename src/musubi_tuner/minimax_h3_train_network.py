@@ -10,7 +10,7 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3 import minimax_h3_utils
-from musubi_tuner.minimax_h3.model import MiniMaxH3Model, time_shift_sigma
+from musubi_tuner.minimax_h3.model import KEYFRAME_CLEAN, MiniMaxH3Model, time_shift_sigma
 from musubi_tuner.utils import model_utils
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--audio_loss_weight must be non-negative")
         self.dit_dtype = torch.bfloat16
         args.dit_dtype = "bfloat16"
-        self._i2v_training = False
+        self._i2v_training = args.i2v
         self._control_training = False
         self.default_guidance_scale = 1.0
         self.default_discrete_flow_shift = args.video_flow_shift
@@ -132,6 +132,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     ):
         if "latents_audio" not in batch or "h3_text_embed" not in batch:
             raise ValueError("H3 audio and text caches are missing; run both minimax_h3 cache commands first")
+        if self.i2v_training and "latents_image" not in batch:
+            raise ValueError("H3 I2V reference latents are missing; rerun minimax_h3_cache_latents.py with --i2v")
         sigma_video, _timesteps = self.get_noisy_model_input_and_timesteps(
             args,
             noise,
@@ -158,14 +160,38 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         tags = [value.to(accelerator.device, dtype=torch.long) for value in batch.get("h3_token_tags", [])]
         if not tags:
             tags = [torch.ones(value.shape[0], device=accelerator.device, dtype=torch.long) for value in contexts]
+        vision_context = [bool((value == 0).any()) for value in tags]
+        if self.i2v_training and not all(vision_context):
+            raise ValueError(
+                "H3 I2V text caches have no first-frame vision rows; rerun "
+                "minimax_h3_cache_text_encoder_outputs.py with --i2v"
+            )
+        if not self.i2v_training and any(vision_context):
+            raise ValueError("H3 first-frame vision text caches require --i2v training")
+
+        condition_video = None
+        if self.i2v_training:
+            clean_condition = batch["latents_image"].to(accelerator.device, dtype=network_dtype)
+            condition_noise = torch.randn_like(clean_condition)
+            condition_sigma = 1.0 - KEYFRAME_CLEAN
+            condition_video = KEYFRAME_CLEAN * clean_condition + condition_sigma * condition_noise
         if args.gradient_checkpointing:
             noisy_video.requires_grad_(True)
             noisy_audio.requires_grad_(True)
+            if condition_video is not None:
+                condition_video.requires_grad_(True)
             for value in contexts:
                 value.requires_grad_(True)
 
         with accelerator.autocast():
-            pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
+            pred_video, pred_audio = transformer(
+                noisy_video,
+                noisy_audio,
+                sigma_video,
+                contexts,
+                tags,
+                condition_video=condition_video,
+            )
         target_video = clean_video - noise_video
         target_audio = clean_audio - noise_audio
         video_loss = self._weighted_mse(pred_video.to(network_dtype), target_video, sigma_video, args.weighting_scheme)
@@ -175,6 +201,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
 
 def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--i2v",
+        action="store_true",
+        help="train H3 FL2VA using each target video's first frame as the reference image",
+    )
     parser.add_argument("--video_flow_shift", type=float, default=12.0, help="H3 video sigma shift")
     parser.add_argument("--audio_flow_shift", type=float, default=3.0, help="H3 audio sigma shift")
     parser.add_argument("--audio_loss_weight", type=float, default=1.0, help="relative audio reconstruction loss weight")

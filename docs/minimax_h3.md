@@ -2,7 +2,7 @@
 
 ## Scope
 
-Musubi Tuner supports experimental LoRA training of the MiniMax H3 **FL2VA** checkpoint in joint text-to-video-with-audio (T2VA) mode. Video and stereo audio are trained together. The separate Ref2VA checkpoint and reference-media conditioning are not supported yet, nor is sample generation during training.
+Musubi Tuner supports experimental LoRA training of the MiniMax H3 **FL2VA** checkpoint in joint text-to-video-with-audio (T2VA) and first-frame-to-video-with-audio (I2V) modes. Video and stereo audio are trained together. In I2V mode, the first frame of every training crop is used automatically as its reference image. The separate Ref2VA checkpoint and general reference-media conditioning are not supported yet, nor is sample generation during training.
 
 H3 is exceptionally large. BF16 compute is required, but the frozen transformer base may use either BF16 or ComfyUI INT8/ConvRot weights. Both the regular and pruned FL2VA INT8/ConvRot checkpoints are supported; NVFP4 is not. Gradient checkpointing and block swap are strongly recommended.
 
@@ -72,9 +72,11 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --text_encoder_dtype bfloat16
 ```
 
-For ComfyUI weights, give each corresponding `.safetensors` path instead. `--tokenizer` may point to the official `FL2VA/tokenizer` directory; if omitted, it is loaded from the official Hugging Face repository.
+For first-frame I2V training, add `--i2v` to **both** cache commands. The latent cache separately encodes the crop's first frame with H3's FL2VA keyframe recipe, and the text cache includes that same frame as Qwen3-VL vision context. Because the reference depends on the crop start, H3 I2V text caches are stored per temporal crop.
 
-The text cache contains raw-prompt Qwen3-VL features immediately after layer 50, before the final RMSNorm. Chat templates and automatic special tokens are intentionally not applied, matching H3 FL2VA inference.
+For ComfyUI weights, give each corresponding `.safetensors` path instead. `--tokenizer` and the I2V-only `--processor` may point to the official `FL2VA/tokenizer` and `FL2VA/processor` directories. If omitted, local model-bundle directories are tried first, followed by the official Hugging Face repository.
+
+The text cache contains Qwen3-VL features immediately after layer 50, before the final RMSNorm. T2VA uses the raw prompt. I2V prepends H3's `Picture 1` vision presentation for the first frame; chat templates and automatic tokenizer special tokens are not applied.
 
 ## Training
 
@@ -91,6 +93,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
   --max_train_epochs 16 --save_every_n_epochs 1 \
   --output_dir path/to/output --output_name h3-lora
 ```
+
+Add `--i2v` to the training command to use the first-frame caches. The reference latent is noise-augmented with H3's released `0.999` clean coefficient and packed ahead of the target audio/video rows; it is not included in the reconstruction loss.
 
 To train against a Comfy INT8/ConvRot base, point `--dit` at either FL2VA INT8 file listed above. Do not pass `--fp8_base` or `--fp8_scaled`; quantization is detected from the checkpoint metadata. The frozen base uses INT8 forward matmuls, while its input-gradient path dequantizes bounded BF16 chunks for training accuracy. The trainable LoRA and model compute remain BF16.
 

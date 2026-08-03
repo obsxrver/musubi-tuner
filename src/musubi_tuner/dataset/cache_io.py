@@ -38,7 +38,12 @@ logger = logging.getLogger(__name__)
 # and `<content_type>_<dtype|mask>` for other tensors
 
 
-def save_latent_cache_minimax_h3(item_info: ItemInfo, video_latent: torch.Tensor, audio_latent: torch.Tensor):
+def save_latent_cache_minimax_h3(
+    item_info: ItemInfo,
+    video_latent: torch.Tensor,
+    audio_latent: torch.Tensor,
+    image_latent: Optional[torch.Tensor] = None,
+):
     """MiniMax H3 joint video/audio latents."""
     assert video_latent.dim() == 4, "video latent must be [C,T,H,W]"
     assert audio_latent.dim() == 3 and audio_latent.shape[1] == 2, "audio latent must be [C,2,T]"
@@ -49,6 +54,16 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, video_latent: torch.Tensor
         f"latents_{frames}x{height}x{width}_{dtype_str}": video_latent.detach().cpu().contiguous(),
         f"latents_audio_2x{audio_latent.shape[-1]}_{audio_dtype_str}": audio_latent.detach().cpu().contiguous(),
     }
+    if image_latent is not None:
+        assert image_latent.dim() == 4 and image_latent.shape[1] == 1, "image latent must be [C,1,H,W]"
+        assert image_latent.shape[0] == video_latent.shape[0] and image_latent.shape[2:] == video_latent.shape[2:], (
+            "image latent channels and spatial shape must match the target video latent"
+        )
+        _, image_frames, image_height, image_width = image_latent.shape
+        image_dtype_str = dtype_to_str(image_latent.dtype)
+        sd[f"latents_image_{image_frames}x{image_height}x{image_width}_{image_dtype_str}"] = (
+            image_latent.detach().cpu().contiguous()
+        )
     save_latent_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_H3_FULL)
 
 

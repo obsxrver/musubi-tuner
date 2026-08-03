@@ -62,7 +62,7 @@ If you find this project helpful, please consider supporting its development via
 ### Recent Updates
 
 - August 2, 2026
-    - Added experimental MiniMax H3 FL2VA joint video/audio LoRA training support. See the [MiniMax H3 documentation](./docs/minimax_h3.md).
+    - Added experimental MiniMax H3 FL2VA joint video/audio LoRA training support, including first-frame I2V training. See the [MiniMax H3 documentation](./docs/minimax_h3.md).
 
 GitHub Discussions Enabled: We've enabled GitHub Discussions for community Q&A, knowledge sharing, and technical information exchange. Please use Issues for bug reports and feature requests, and Discussions for questions and sharing experiences. [Join the conversation →](https://github.com/kohya-ss/musubi-tuner/discussions)
 

@@ -35,6 +35,28 @@ def _text_config():
     )
 
 
+def _multimodal_config():
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+
+    return Qwen3VLConfig(
+        text_config=_text_config().to_dict(),
+        vision_config={
+            "depth": 27,
+            "hidden_size": 1152,
+            "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": 4304,
+            "num_heads": 16,
+            "in_channels": 3,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "out_hidden_size": 5120,
+            "num_position_embeddings": 2304,
+            "deepstack_visual_indexes": [8, 16, 24],
+        },
+    )
+
+
 def _text_key(source_key: str) -> Optional[str]:
     key = source_key
     prefixes = (
@@ -62,26 +84,68 @@ def _text_key(source_key: str) -> Optional[str]:
     return key
 
 
+def _multimodal_key(source_key: str) -> Optional[str]:
+    """Map official and Comfy Qwen3-VL keys into a truncated Qwen3VLModel."""
+    key = source_key
+    prefixes = (
+        "text_encoders.qwen3vl_32b.transformer.",
+        "qwen3vl_32b.transformer.",
+    )
+    for prefix in prefixes:
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+
+    if key.startswith("model.language_model."):
+        key = "language_model." + key[len("model.language_model.") :]
+    elif key.startswith("language_model."):
+        pass
+    elif key.startswith("model.visual."):
+        key = "visual." + key[len("model.visual.") :]
+    elif key.startswith("visual."):
+        pass
+    elif key.startswith("model."):
+        # Comfy's converted checkpoint calls the text tower `model`.
+        key = "language_model." + key[len("model.") :]
+    else:
+        return None
+
+    if key == "language_model.norm.weight" or key.startswith("language_model.layers.50."):
+        return None
+    if key.startswith("language_model.layers."):
+        try:
+            if int(key.split(".", 3)[2]) >= 50:
+                return None
+        except (ValueError, IndexError):
+            pass
+    return key
+
+
 def load_text_encoder(
     path: str,
     *,
     device: torch.device | str,
     dtype: torch.dtype = torch.bfloat16,
+    include_visual: bool = False,
     disable_numpy_memmap: bool = False,
 ):
     """Load only layers 0..49, returning the unnormalized layer-50 hidden state."""
 
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel, Qwen3VLTextModel
 
     with torch.device("meta"):
-        model = Qwen3VLTextModel(_text_config())
-        model.norm = nn.Identity()
+        if include_visual:
+            model = Qwen3VLModel(_multimodal_config())
+            model.language_model.norm = nn.Identity()
+        else:
+            model = Qwen3VLTextModel(_text_config())
+            model.norm = nn.Identity()
     load_selected_weights(
         model,
         resolve_safetensor_files(path, "text_encoder"),
         device=device,
         dtype=dtype,
-        key_transform=_text_key,
+        key_transform=_multimodal_key if include_visual else _text_key,
         disable_numpy_memmap=disable_numpy_memmap,
     )
     model.eval().requires_grad_(False)
@@ -104,8 +168,74 @@ def load_tokenizer(path: Optional[str], text_encoder_path: Optional[str] = None)
     return AutoTokenizer.from_pretrained("MiniMaxAI/MiniMax-H3", subfolder="FL2VA/tokenizer", trust_remote_code=True)
 
 
+def load_processor(path: Optional[str], text_encoder_path: Optional[str] = None):
+    from transformers import AutoProcessor
+
+    if path is not None:
+        return AutoProcessor.from_pretrained(path, trust_remote_code=True)
+    if text_encoder_path:
+        candidate = Path(text_encoder_path)
+        search = [candidate, candidate.parent] if candidate.is_dir() else [candidate.parent]
+        for root in search:
+            for processor_dir in (root / "FL2VA" / "processor", root / "processor", root / "FL2VA" / "text_encoder"):
+                if (processor_dir / "preprocessor_config.json").exists():
+                    return AutoProcessor.from_pretrained(processor_dir, trust_remote_code=True)
+    return AutoProcessor.from_pretrained("MiniMaxAI/MiniMax-H3", subfolder="FL2VA/processor", trust_remote_code=True)
+
+
 @torch.no_grad()
-def encode_prompts(tokenizer, text_encoder, prompts: list[str], device, max_length: int = 1024):
+def encode_prompts(
+    tokenizer,
+    text_encoder,
+    prompts: list[str],
+    device,
+    max_length: int = 1024,
+    processor=None,
+    images: Optional[list] = None,
+):
+    if images is not None:
+        if processor is None or len(images) != len(prompts):
+            raise ValueError("H3 I2V text encoding requires one processor image per prompt")
+        outputs = []
+        tags = []
+        for prompt, image in zip(prompts, images):
+            vision = processor.image_processor(images=[image], return_tensors="pt")
+            pixel_values = vision["pixel_values"]
+            image_grid_thw = vision["image_grid_thw"]
+            merge_size = processor.image_processor.merge_size**2
+            num_image_tokens = int(image_grid_thw[0].prod()) // merge_size
+
+            label_ids = tokenizer("<Picture 1>: ", add_special_tokens=False)["input_ids"]
+            vision_ids = (
+                [tokenizer.convert_tokens_to_ids("<|vision_start|>")]
+                + [tokenizer.convert_tokens_to_ids("<|image_pad|>")] * num_image_tokens
+                + [tokenizer.convert_tokens_to_ids("<|vision_end|>")]
+            )
+            prompt_ids = tokenizer(
+                prompt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"]
+            input_ids = torch.tensor([label_ids + vision_ids + prompt_ids], device=device, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids)
+            hidden = text_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values.to(device=device, dtype=text_encoder.dtype),
+                image_grid_thw=image_grid_thw.to(device),
+                use_cache=False,
+            ).last_hidden_state[0]
+            outputs.append(hidden.contiguous())
+            tags.append(
+                torch.tensor(
+                    [1] * len(label_ids) + [0] * len(vision_ids) + [1] * len(prompt_ids),
+                    device=hidden.device,
+                    dtype=torch.int64,
+                )
+            )
+        return outputs, tags
+
     tokenizer.padding_side = "right"
     encoded = tokenizer(
         prompts,

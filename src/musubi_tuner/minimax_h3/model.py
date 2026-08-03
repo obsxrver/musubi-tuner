@@ -25,6 +25,7 @@ FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
 VIDEO_SIGMA_SHIFT = 12.0
 AUDIO_SIGMA_SHIFT = 3.0
+KEYFRAME_CLEAN = 0.999
 
 
 def time_shift_sigma(sigma: torch.Tensor, from_shift: float, to_shift: float) -> torch.Tensor:
@@ -139,25 +140,28 @@ def apply_split_half_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor
 
 
 class PackedLayout:
-    """Packed ``[text | audio | video]`` layout for T2VA training."""
+    """Packed ``[text | first-frame condition | audio | video]`` layout."""
 
-    def __init__(self, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int):
+    def __init__(self, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int, condition_t: int = 0):
         frame, width_grid = _frame_grid(latent_h, latent_w)
         cursor = float(text_len)
 
         text_pos = torch.zeros(text_len, 3, dtype=torch.float64)
         text_pos[:, 0] = torch.arange(text_len, dtype=torch.float64)
+        condition_pos = _video_grid(condition_t, frame, cursor) if condition_t else torch.empty(0, 3, dtype=torch.float64)
         audio_pos = _audio_grid(cursor, audio_t, float(width_grid[0]), float(width_grid[-1]))
         video_pos = _video_grid(latent_t, frame, cursor)
 
-        audio_start = text_len
+        condition_start = text_len
+        audio_start = condition_start + condition_pos.shape[0]
         video_start = audio_start + audio_t * 2
         self.text_slice = (0, text_len)
+        self.condition_slice = (condition_start, audio_start)
         self.audio_slice = (audio_start, video_start)
         self.video_slice = (video_start, video_start + video_pos.shape[0])
-        self.position_ids = torch.cat([text_pos, audio_pos, video_pos], dim=0)
+        self.position_ids = torch.cat([text_pos, condition_pos, audio_pos, video_pos], dim=0)
         self.seq_len = self.position_ids.shape[0]
-        self.signature = (text_len, latent_t, latent_h, latent_w, audio_t)
+        self.signature = (text_len, condition_t, latent_t, latent_h, latent_w, audio_t)
 
 
 class TimeEmbedder(nn.Module):
@@ -473,6 +477,7 @@ class MiniMaxH3Model(nn.Module):
         sigma_video: torch.Tensor,
         context: torch.Tensor,
         text_token_tags: torch.Tensor | None,
+        condition_video: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if video.shape[0] != 1 or audio.shape[0] != 1 or context.shape[0] != 1:
             raise ValueError("_forward_single requires batch size 1")
@@ -480,15 +485,25 @@ class MiniMaxH3Model(nn.Module):
             raise ValueError("H3 video latent height and width must be divisible by the spatial patch size")
 
         latent_t, latent_h, latent_w = video.shape[-3:]
+        condition_t = 0
+        if condition_video is not None:
+            if condition_video.shape[:2] != (1, self.latents_dim):
+                raise ValueError(f"H3 condition video must be [1,{self.latents_dim},T,H,W]")
+            if condition_video.shape[-2:] != (latent_h, latent_w):
+                raise ValueError("H3 condition video spatial shape must match the target video")
+            condition_t = condition_video.shape[-3]
+            if condition_t != 1:
+                raise ValueError(f"H3 first-frame conditioning requires one latent frame, got {condition_t}")
         audio_t = audio.shape[-1]
         text_len = context.shape[1]
-        layout = PackedLayout(text_len, latent_t, latent_h, latent_w, audio_t)
+        layout = PackedLayout(text_len, latent_t, latent_h, latent_w, audio_t, condition_t)
 
         sigma_v = sigma_video.flatten()[0].float().clamp(1e-6, 1.0)
         sigma_a = time_shift_sigma(sigma_v, self.sigma_shift_video, self.sigma_shift_audio)
         t_video = float(1.0 - sigma_v)
         t_audio = float(1.0 - sigma_a)
-        unique_times = sorted({t_video, t_audio})
+        t_condition = max(t_video, KEYFRAME_CLEAN) if condition_video is not None else None
+        unique_times = sorted({t_video, t_audio} | ({t_condition} if t_condition is not None else set()))
         time_row = {value: index for index, value in enumerate(unique_times)}
 
         if text_token_tags is None:
@@ -500,6 +515,8 @@ class MiniMaxH3Model(nn.Module):
 
         modulation_rows = torch.empty(layout.seq_len, device=video.device, dtype=torch.long)
         modulation_rows[:text_len] = time_row[t_video] * 3 + text_token_tags
+        if t_condition is not None:
+            modulation_rows[layout.condition_slice[0] : layout.condition_slice[1]] = time_row[t_condition] * 3
         modulation_rows[layout.audio_slice[0] : layout.audio_slice[1]] = time_row[t_audio] * 3 + 2
         modulation_rows[layout.video_slice[0] : layout.video_slice[1]] = time_row[t_video] * 3
 
@@ -508,10 +525,18 @@ class MiniMaxH3Model(nn.Module):
         audio_rows = pack_audio(audio.float())
         video_embed = self.video_patch_proj(video_rows).to(compute_dtype)
         audio_embed = self.audio_patch_proj(audio_rows).to(compute_dtype)
+        condition_embed = None
+        if condition_video is not None:
+            condition_rows = patchify_video(condition_video.float(), self.patch_size)
+            condition_embed = self.video_patch_proj(condition_rows).to(compute_dtype)
 
         if context.shape[-1] != self.hidden_size:
             context = self.token_refiner(self.condition_proj(context), self.gradient_checkpointing)
-        hidden = torch.cat([context, audio_embed, video_embed], dim=1)
+        hidden_parts = [context]
+        if condition_embed is not None:
+            hidden_parts.append(condition_embed)
+        hidden_parts.extend([audio_embed, video_embed])
+        hidden = torch.cat(hidden_parts, dim=1)
 
         time_values = torch.tensor(unique_times, device=video.device, dtype=torch.float32)
         if self.use_adaln_curves:
@@ -560,6 +585,7 @@ class MiniMaxH3Model(nn.Module):
         sigma_video: torch.Tensor,
         context: torch.Tensor | list[torch.Tensor],
         text_token_tags: torch.Tensor | list[torch.Tensor] | None = None,
+        condition_video: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return raw checkpoint predictions (``clean - noise``) for both streams.
 
@@ -570,6 +596,8 @@ class MiniMaxH3Model(nn.Module):
 
         outputs_video: list[torch.Tensor] = []
         outputs_audio: list[torch.Tensor] = []
+        if condition_video is not None and condition_video.shape[0] != video.shape[0]:
+            raise ValueError("H3 condition video batch size must match the target video")
         for index in range(video.shape[0]):
             context_i = context[index]
             if context_i.ndim == 2:
@@ -577,12 +605,14 @@ class MiniMaxH3Model(nn.Module):
             tags_i = None
             if text_token_tags is not None:
                 tags_i = text_token_tags[index]
+            condition_i = None if condition_video is None else condition_video[index : index + 1]
             video_i, audio_i = self._forward_single(
                 video[index : index + 1],
                 audio[index : index + 1],
                 sigma_video[index : index + 1],
                 context_i,
                 tags_i,
+                condition_i,
             )
             outputs_video.append(video_i)
             outputs_audio.append(audio_i)
