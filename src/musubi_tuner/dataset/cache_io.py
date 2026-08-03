@@ -15,6 +15,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
+    ARCHITECTURE_MINIMAX_H3_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
@@ -35,6 +36,20 @@ logger = logging.getLogger(__name__)
 
 # the keys of the dict are `<content_type>_FxHxW_<dtype>` for latents
 # and `<content_type>_<dtype|mask>` for other tensors
+
+
+def save_latent_cache_minimax_h3(item_info: ItemInfo, video_latent: torch.Tensor, audio_latent: torch.Tensor):
+    """MiniMax H3 joint video/audio latents."""
+    assert video_latent.dim() == 4, "video latent must be [C,T,H,W]"
+    assert audio_latent.dim() == 3 and audio_latent.shape[1] == 2, "audio latent must be [C,2,T]"
+    _, frames, height, width = video_latent.shape
+    dtype_str = dtype_to_str(video_latent.dtype)
+    audio_dtype_str = dtype_to_str(audio_latent.dtype)
+    sd = {
+        f"latents_{frames}x{height}x{width}_{dtype_str}": video_latent.detach().cpu().contiguous(),
+        f"latents_audio_2x{audio_latent.shape[-1]}_{audio_dtype_str}": audio_latent.detach().cpu().contiguous(),
+    }
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_H3_FULL)
 
 
 def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
@@ -350,6 +365,16 @@ def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor)
     sd[f"varlen_{text_encoder_type}_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_text_encoder_output_cache_minimax_h3(item_info: ItemInfo, embed: torch.Tensor, token_tags: torch.Tensor):
+    """Store unnormalized Qwen3-VL layer-50 features and modality tags."""
+    assert embed.dim() == 2 and token_tags.dim() == 1 and embed.shape[0] == token_tags.shape[0]
+    sd = {
+        f"varlen_h3_text_embed_{dtype_to_str(embed.dtype)}": embed.detach().cpu().contiguous(),
+        f"varlen_h3_token_tags_{dtype_to_str(token_tags.dtype)}": token_tags.detach().cpu().contiguous(),
+    }
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_H3_FULL, merge_existing=False)
 
 
 def save_text_encoder_output_cache_framepack(

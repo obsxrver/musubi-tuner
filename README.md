@@ -41,7 +41,7 @@
 
 ## Introduction
 
-This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, and Z-Image architectures. 
+This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, Z-Image, and MiniMax H3 architectures.
 
 This repository is unofficial and not affiliated with the official repositories of these architectures.
 
@@ -60,6 +60,9 @@ We are grateful to the following companies for their generous sponsorship:
 If you find this project helpful, please consider supporting its development via [GitHub Sponsors](https://github.com/sponsors/kohya-ss/). Your support is greatly appreciated!
 
 ### Recent Updates
+
+- August 2, 2026
+    - Added experimental MiniMax H3 FL2VA joint video/audio LoRA training support. See the [MiniMax H3 documentation](./docs/minimax_h3.md).
 
 GitHub Discussions Enabled: We've enabled GitHub Discussions for community Q&A, knowledge sharing, and technical information exchange. Please use Issues for bug reports and feature requests, and Discussions for questions and sharing experiences. [Join the conversation →](https://github.com/kohya-ss/musubi-tuner/discussions)
 
@@ -148,6 +151,8 @@ This approach ensures that you have full control over the instructions given to 
 For detailed information on specific architectures, configurations, and advanced features, please refer to the documentation below.
 
 **Architecture-specific:**
+
+- [MiniMax H3](./docs/minimax_h3.md)
 - [HunyuanVideo](./docs/hunyuan_video.md)
 - [Wan2.1/2.2](./docs/wan.md)
 - [Wan2.1/2.2 (Single Frame)](./docs/wan_1f.md)

@@ -34,6 +34,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
 )
@@ -60,6 +61,9 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        # Original media location/crop, used by architectures that also cache synchronized audio.
+        self.source_path: Optional[str] = None
+        self.source_frame_start: int = 0
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -625,7 +629,8 @@ class VideoDataset(BaseDataset):
         self.source_fps = source_fps
         self.fp_latent_window_size = fp_latent_window_size
 
-        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
+        self.vae_frame_stride = 4
+        self.vae_frame_offset = 1
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
@@ -638,6 +643,10 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            self.target_fps = 24
+            self.vae_frame_stride = 17
+            self.vae_frame_offset = 5
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
@@ -645,8 +654,10 @@ class VideoDataset(BaseDataset):
             target_frames = list(set(target_frames))
             target_frames.sort()
 
-            # round each value to N*4+1
-            rounded_target_frames = [(f - 1) // self.vae_frame_stride * self.vae_frame_stride + 1 for f in target_frames]
+            rounded_target_frames = [
+                max(self.vae_frame_offset, (f - self.vae_frame_offset) // self.vae_frame_stride * self.vae_frame_stride + self.vae_frame_offset)
+                for f in target_frames
+            ]
             rounded_target_frames = list(set(rounded_target_frames))
             rounded_target_frames.sort()
 
@@ -764,8 +775,18 @@ class VideoDataset(BaseDataset):
                                     crop_pos_and_frames.append((i, target_frame))
                     elif self.frame_extraction == "full":
                         # select all frames
+                        if frame_count < self.vae_frame_offset:
+                            logger.warning(
+                                f"Skipping {video_key}: H3 requires at least {self.vae_frame_offset} frames, got {frame_count}"
+                            )
+                            futures.remove(future)
+                            continue
                         target_frame = min(frame_count, self.max_frames)
-                        target_frame = (target_frame - 1) // self.vae_frame_stride * self.vae_frame_stride + 1  # round to N*4+1
+                        target_frame = max(
+                            self.vae_frame_offset,
+                            (target_frame - self.vae_frame_offset) // self.vae_frame_stride * self.vae_frame_stride
+                            + self.vae_frame_offset,
+                        )
                         crop_pos_and_frames.append((0, target_frame))
                     else:
                         raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
@@ -789,6 +810,8 @@ class VideoDataset(BaseDataset):
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                        item_info.source_path = video_key
+                        item_info.source_frame_start = crop_pos
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 

@@ -38,7 +38,7 @@
 
 ## はじめに
 
-このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、FLUX.2 dev/klein、Qwen-Image、Z-ImageのLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、それらの公式リポジトリとは関係ありません。
+このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、FLUX.2 dev/klein、Qwen-Image、Z-Image、MiniMax H3のLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、それらの公式リポジトリとは関係ありません。
 
 *リポジトリは開発中です。*
 
@@ -143,6 +143,8 @@ Musubi Tunerの解説記事執筆や、関連ツールの開発に取り組ん�
 各アーキテクチャの詳細、設定、高度な機能については、以下のドキュメントを参照してください。
 
 **アーキテクチャ別:**
+
+- [MiniMax H3](./docs/minimax_h3.md)
 - [HunyuanVideo](./docs/hunyuan_video.md)
 - [Wan2.1/2.2](./docs/wan.md)
 - [Wan2.1/2.2 (1フレーム推論)](./docs/wan_1f.md)
